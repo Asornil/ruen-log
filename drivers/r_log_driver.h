@@ -22,7 +22,7 @@
     #elif defined(__XTENSA__)
         #define R_LOG_DRIVER R_LOG_DRIVER_ESP32
     #else
-        #error "R_LOG_DRIVER 未定义且无法自动识别平台，请手动指定"
+        #error "R_LOG_DRIVER is not defined and platform cannot be auto-detected, please specify manually"
     #endif
 #endif /*R_LOG_DRIVER*/
 

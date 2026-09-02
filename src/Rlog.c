@@ -2,15 +2,15 @@
 #include "../drivers/r_log_driver.h"
 
 #if defined(R_LOG_DRIVER) && (R_LOG_DRIVER == 0)
-    #error "不要将 `R_LOG_DRIVER` 设置为 `0` 这是无效值"
+    #error "Do not set `R_LOG_DRIVER` to `0` as it is an invalid value"
 #endif
 
 #if (R_LOG_OUT_MODE == 1) && ((R_LOG_MEM_MODE == 0) || (R_LOG_MEM_MODE == 1))
-    #error "异步模式(R_LOG_OUT_MODE == 1) 仅支持内存模式 `2` 和 `3`"
+    #error "Asynchronous mode (R_LOG_OUT_MODE == 1) only supports memory modes `2` and `3`"
 #endif 
 
 #if (R_LOG_BUF_SIZE < 128)
-    #error "R_LOG_BUF_SIZE must be >= 64"
+    #error "R_LOG_BUF_SIZE must be >= 128"
 #endif
 
 #include <string.h>
@@ -343,34 +343,6 @@ static inline void r_log_time_local_get(r_log_dev_tl_t *t_local)
     r_log_driver_time_local_get(t_local);
 }
 
-// 左对齐：数字靠左，右侧填充
-static inline uint16_t r_log_tool_10_to_16_left(uint8_t  *buf,uint32_t number,uint16_t width,uint8_t pad_char)
-{
-    uint16_t len = 0;
-    uint32_t n = number;
-    uint16_t i = 0;
-    uint8_t t = 0;
-
-    do {
-        buf[len++] = r_log_hex[n & 0x0F];
-        n >>= 4;
-    } while (n > 0);
-
-    for (i = 0; i < len / 2; i++)
-    {
-        t = buf[i];
-        buf[i] = buf[len - 1 - i];
-        buf[len - 1 - i] = t;
-    }
-
-    for (i = len; i < width; i++) 
-    {
-        buf[i] = pad_char;
-    }
-
-    return (width > len) ? width : len;
-}
-
 // 右对齐：数字靠右，左侧填充
 static inline uint16_t r_log_tool_10_to_16_right(
     uint8_t  *buf,
@@ -413,7 +385,7 @@ static inline uint16_t r_log_tool_10_to_16_right(
 }
 
 // 工具，10进制转字符，不对齐，顺序写
-static inline uint16_t r_log_tool_10_to_str(char *buf, uint32_t number)
+static inline uint16_t r_log_tool_10_to_str(uint8_t *buf, uint32_t number)
 {
     uint32_t temp = number;
     uint16_t digits = 0;
@@ -444,8 +416,9 @@ static inline uint16_t r_log_tool_10_to_str(char *buf, uint32_t number)
     return pos;
 }
 
+#if ((R_LOG_TIME_RUN >= 4) && (R_LOG_TIME_RUN < 5))
 // 工具，10进制转字符，左对齐，剩余补任意字符
-static inline uint16_t r_log_tool_10_to_str_left(char *buf, uint32_t number, uint16_t width, char pad_char)
+static inline uint16_t r_log_tool_10_to_str_left(uint8_t *buf, uint32_t number, uint16_t width, char pad_char)
 {
     uint32_t temp = number;
     uint16_t digits = 0;
@@ -485,9 +458,10 @@ static inline uint16_t r_log_tool_10_to_str_left(char *buf, uint32_t number, uin
 
     return len;
 }
+#endif
 
 // 右对齐：数字靠右，左侧填充
-static inline uint16_t r_log_tool_10_to_str_right(char *buf, uint32_t number, uint16_t width, char pad_char)
+static inline uint16_t r_log_tool_10_to_str_right(uint8_t *buf, uint32_t number, uint16_t width, char pad_char)
 {
     uint32_t temp = number;
     uint16_t digits = 0;
@@ -1014,7 +988,7 @@ int32_t r_log_out(r_log_level_t level,const char *tag, const char *f_name,uint32
     // 添加信息
     *buf_ops++ = ' ';
     va_start(args, fmt);
-    res = vsnprintf(buf_ops, (R_LOG_BUF_SIZE - (buf_ops - r_log_tx_buf)), fmt, args);
+    res = vsnprintf((char *)buf_ops, (R_LOG_BUF_SIZE - (buf_ops - r_log_tx_buf)), fmt, args);
     if ((size_t)res >= (R_LOG_BUF_SIZE - (buf_ops - r_log_tx_buf))) { return R_LOG_ERROR_BUF_SIZE; }
     if (res < 0){ return R_LOG_ERROR_CODE; }
     va_end(args);

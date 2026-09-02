@@ -69,10 +69,12 @@ rune-log/
 |----|-----|------|------|
 | 1 | `R_LOG_DRIVER_WINDOWS` | Windows | ✅ 已实现 |
 | 2 | `R_LOG_DRIVER_LINUX` | Linux | ✅ 已实现 |
-| 3 | `R_LOG_DRIVER_STM32` | STM32 (F103C8T6) | 🚧 开发中 |
+| 3 | `R_LOG_DRIVER_STM32` | STM32 (F103C8T6) | ✅ 已实现（示例驱动） |
 | 4 | `R_LOG_DRIVER_ESP32` | ESP32 (XTENSA) | 🚧 开发中 |
 
 **不指定时自动检测**（`_WIN32` / `__linux__` / `__ARM_ARCH_7M__` / `__XTENSA__`），检测失败会 `#error` 提示手动指定。交叉编译或编译器宏不齐全时，用 `-DR_LOG_DRIVER=3` 手动指定（Keil/IAR 在 Preprocessor Define 里同样写法）。
+
+> STM32 工程还需：链接 ST 标准外设库（SPL），Preprocessor 定义 `STM32F10X_MD`（或新版头文件的 `STM32F103xB`）；驱动 `alloc/free` 走 `malloc`，需在启动文件配置足够的堆大小（或用 `R_LOG_MEM_MODE=1/3` 避开动态分配）。
 
 ### 3. 编译
 
@@ -222,6 +224,24 @@ int main(void)
 
 每个 vendor 文件用 `#if (R_LOG_DRIVER == R_LOG_DRIVER_xxx)` 包裹实现，未选中平台编译为空单元。
 
+### STM32 示例驱动（vendor_stm32.c）
+
+完整可运行的**示例驱动**，基于 ST 标准外设库（SPL），供 F103C8T6 裸机开箱使用；不满足需求时可直接修改或整体替换。
+
+| 能力 | 实现 |
+|------|------|
+| 输出 | USART1 DMA 发送（115200，带超时） |
+| 运行时间 | SysTick 毫秒计数 |
+| 本地时间 | RTC（LSI）叠加时区偏移，支持 1970-2106 |
+| 内存 | `malloc/free`（需配置堆） |
+
+定制点（均在 `vendor_stm32.c`）：
+
+- `serial_init()` 中 `rtc_set_unix_time()` / `rtc_set_time_zone()` 为硬编码默认值（初始时间戳 + 时区分钟，如 320 = 东八区），上电后调用覆盖即可
+- 波特率 / 环形缓冲 / DMA 缓冲大小均为文件顶部宏
+- 驱动额外占用 RAM：环形缓冲 512B + DMA 缓冲 128B（与核心 RAM 预算无关）
+- 文件内 `CHIP` 宏区分实现：`STM32_F103C8T6_STD`（标准库，已实现）/ `STM32_F103C8T6_HAL`（HAL 库，预留）
+
 ### 接入新平台（3 步）
 
 1. 新建 `drivers/vendor_xxx.c`，实现上述 6 个接口（含文件内 `#if` 守卫）
@@ -352,7 +372,7 @@ rune-log/
 │   ├── r_log_driver.h      # 驱动接口 + 平台枚举 + 自动检测
 │   ├── vendor_windows.c    # Windows 驱动
 │   ├── vendor_linux.c      # Linux 驱动
-│   ├── vendor_stm32.c      # STM32 驱动（开发中）
+│   ├── vendor_stm32.c      # STM32 标准库驱动（示例，可替换）
 │   └── vendor_esp32.c      # ESP32 驱动（开发中）
 ├── example.c               # 12 场景示例
 ├── CMakeLists.txt          # 可选：纯文件列表，无平台逻辑

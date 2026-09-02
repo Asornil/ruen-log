@@ -205,14 +205,18 @@ int32_t r_log_out(r_log_level_t level,const char *tag, const char *f_name,uint32
  */
 #ifndef __FILE_NAME__
 
-static inline const char* get_filename(const char* path) 
+static inline const char* get_filename(const char* path)
 {
-    const char* sep = strrchr(path, '/');
-    if (!sep) 
-    {
-        sep = strrchr(path, '\\');
+    const char* p = path;
+    while (*p) { ++p; }
+    while (p != path) {
+        --p;
+        if (*p == '/' || *p == '\\') 
+				{
+            return p + 1;   
+        }
     }
-    return sep ? sep + 1 : path;
+    return path;
 }
 #define __FILE_NAME__ (get_filename(__FILE__))
 
