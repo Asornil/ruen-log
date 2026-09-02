@@ -1,52 +1,21 @@
-#include "r_log.h"
+#include "Rlog.h"
+#include "../drivers/r_log_driver.h"
+
+#if defined(R_LOG_DRIVER) && (R_LOG_DRIVER == 0)
+    #error "不要将 `R_LOG_DRIVER` 设置为 `0` 这是无效值"
+#endif
+
+#if (R_LOG_OUT_MODE == 1) && ((R_LOG_MEM_MODE == 0) || (R_LOG_MEM_MODE == 1))
+    #error "异步模式(R_LOG_OUT_MODE == 1) 仅支持内存模式 `2` 和 `3`"
+#endif 
 
 #if (R_LOG_BUF_SIZE < 128)
     #error "R_LOG_BUF_SIZE must be >= 64"
 #endif
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_WIN32)
-    #include <windows.h>
-    #include <time.h>
-    #include <stdio.h>
-    #include <string.h>
-    #include <stdarg.h>
-    #define PC_WIN
-#elif defined(__linux__)
-    #include <sys/time.h>
-    #include <unistd.h>
-    #define PC_LINUX
-#elif defined(__arm__) && defined(__ARM_ARCH_7M__)
-    #include <string.h>
-    #include <stdarg.h>
-#elif defined(__XTENSA__)
-    #include <string.h>
-    #include <stdarg.h>
-#endif
-
-// 运行时间结构体
-typedef struct r_log_time_run
-{
-    uint32_t time_stemp; // unix 时间戳
-    uint16_t day;        // 天数
-    uint8_t  hour;       // 小时
-    uint8_t  min;        // 分钟
-    uint8_t  sec;        // 秒
-    uint8_t  padding;    // 对齐填充
-    uint16_t ms;         // 毫秒
-}r_log_time_run_t;
-
-// 本地时间结构体
-typedef struct r_log_time_local
-{
-    uint32_t time_stemp; // unix 时间戳
-    uint16_t year;       // 年
-    uint8_t  month;      // 月
-    uint8_t  day;        // 日
-    uint8_t  hour;       // 小时
-    uint8_t  min;        // 分钟
-    uint8_t  sec;        // 秒
-    uint8_t  padding;    // 对齐填充
-}r_log_time_local_t;
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 // 动态状态
 typedef struct r_log_state
@@ -69,20 +38,84 @@ typedef struct r_log_state
  *  全局变量
  * ==================== */
 
-#ifdef PC_WIN
-    static ULONGLONG start = 0;
-#endif /*PC_WIN*/
-#ifdef PC_LINUX
-    static uint64_t start = 0;
-#endif /*PC_LINUX*/
-
 // 状态结构体
 static r_log_state_t r_log_state = {0};
 
-// 通用缓存
-#if (R_LOG_MEM_MODE == 0)
+// 缓存
+#if (R_LOG_MEM_MODE == 0) // 静态内存
 static uint8_t r_log_tx_buf[R_LOG_BUF_SIZE];
+#elif (R_LOG_MEM_MODE == 3) // 静态内存池
+#define R_LOG_MEM_SIZE (R_LOG_QUEUE_SIZE*R_LOG_BUF_SIZE)
+
+static volatile uint32_t r_log_used[R_LOG_QUEUE_SIZE];  // 槽位占用标志 0:空闲 1:占用
+static uint8_t r_log_mem[R_LOG_MEM_SIZE];
 #endif /*R_LOG_MEM_MODE*/
+
+/* 原子 CAS：编译器内置，编译成 CPU 指令，无操作系统依赖
+   使用方：内存池取块(MEM_MODE==3)、异步队列锁(MEM_MODE==2/3 且 OUT_MODE==1) */
+#if (R_LOG_OUT_MODE == 1) || (R_LOG_MEM_MODE == 3)
+#if defined(_MSC_VER)
+    #include <intrin.h>
+    static inline int32_t r_log_atomic_cas(volatile uint32_t *ptr, uint32_t old_val, uint32_t new_val)
+    {
+        return (_InterlockedCompareExchange((volatile long *)ptr, (long)new_val, (long)old_val) == (long)old_val);
+    }
+#elif defined(__CC_ARM) /* ARM Compiler 5 (Keil MDK) */
+    static inline int32_t r_log_atomic_cas(volatile uint32_t *ptr, uint32_t old_val, uint32_t new_val)
+    {
+        uint32_t old;
+        do {
+            old = __ldrex(ptr);
+            if (old != old_val) { __clrex(); return 0; }
+        } while (__strex(new_val, ptr));
+        return 1;
+    }
+#else /* GCC / Clang：Linux、arm-none-eabi、xtensa、MinGW、armclang */
+    static inline int32_t r_log_atomic_cas(volatile uint32_t *ptr, uint32_t old_val, uint32_t new_val)
+    {
+        return __sync_bool_compare_and_swap(ptr, old_val, new_val);
+    }
+#endif
+#endif /*(R_LOG_OUT_MODE == 1) || (R_LOG_MEM_MODE == 3)*/
+
+// 队列
+#if (R_LOG_OUT_MODE == 1)
+
+typedef struct 
+{
+    uint8_t *data; // 数据
+    uint32_t size; // 长度 
+}r_log_qune_t;
+
+static r_log_qune_t r_log_qune_mem[R_LOG_QUEUE_SIZE];
+static volatile uint32_t r_log_qune_write;
+static volatile uint32_t r_log_qune_read;
+static volatile uint32_t r_log_qune_count;
+static volatile uint32_t r_log_qune_lock;   // 队列自旋锁 0:空闲 1:占用
+
+// 队列锁：仅保护"检查+入队/出队"短临界区，发送/格式化在锁外
+static inline void r_log_qune_lock_take(void)
+{
+    while (!r_log_atomic_cas(&r_log_qune_lock, 0, 1)) { }
+}
+
+static inline void r_log_qune_lock_give(void)
+{
+    r_log_qune_lock = 0;
+}
+#endif /*R_LOG_OUT_MODE*/
+
+// TAG 模块表
+#if (R_LOG_TAG_MODE == 1)
+typedef struct
+{
+    const char *tag;    // 模块名字符串（静态存储期）
+    uint8_t     mask;   // 输出等级位掩码 TAG_TRACE|TAG_DEBUG|... 0=静音
+} r_log_tag_t;
+
+static r_log_tag_t r_log_tag_tbl[R_LOG_TAG_MAX];
+static uint8_t     r_log_tag_count;
+#endif /*R_LOG_TAG_MODE*/
 
 // 颜色标签枚举
 typedef enum
@@ -274,12 +307,7 @@ static const char r_log_hex[] = "0123456789ABCDEF";
  */
 static inline void r_log_send_data(uint8_t *buf,uint16_t len)
 {
-   #ifdef PC_WIN
-        printf("%.*s",len,buf);
-   #endif /*PC_WIN*/
-   #ifdef PC_LINUX
-        printf("%.*s",len,buf);
-   #endif /*PC_LINUX*/
+    r_log_driver_send(buf,len);
 }
 
 /**
@@ -287,12 +315,7 @@ static inline void r_log_send_data(uint8_t *buf,uint16_t len)
  */
 static inline void* r_log_alloc(size_t size)
 {
-   #ifdef PC_WIN
-        return malloc(size);
-   #endif /*PC_WIN*/
-   #ifdef PC_LINUX
-        return malloc(size);
-   #endif /*PC_LINUX*/
+   return r_log_driver_alloc(size);
 }
 
 /**
@@ -300,76 +323,24 @@ static inline void* r_log_alloc(size_t size)
  */
 static inline void r_log_free(void *addr)
 {
-   #ifdef PC_WIN
-        free(addr);
-   #endif /*PC_WIN*/
-   #ifdef PC_LINUX
-        free(addr);
-   #endif /*PC_LINUX*/
+    r_log_driver_free(addr);
 }
 
 
 /**
  * 日志获取运行时间
  */
-static inline void r_log_time_run_get(r_log_time_run_t *t_run)
+static inline void r_log_time_run_get(r_log_dev_tr_t *t_run)
 {
-    #ifdef PC_WIN
-        ULONGLONG elapsed = GetTickCount64() - start;
-        t_run->time_stemp = elapsed / 1000;
-        t_run->day  = elapsed / 86400000;
-        t_run->hour = (elapsed / 3600000) % 24;
-        t_run->min = (elapsed / 60000) % 60;
-        t_run->sec = (elapsed / 1000) % 60;
-        t_run->ms = elapsed % 1000;
-        t_run->padding = 0;
-    #endif /*PC_WIN*/
-    #ifdef PC_LINUX
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        uint64_t  now = (uint64_t )tv.tv_sec * 1000 + tv.tv_usec / 1000;
-        uint64_t  elapsed = now - start;
-        t_run->time_stemp = 0;
-        t_run->day  = elapsed / 8640000;
-        t_run->hour = (elapsed / 3600000) % 24;
-        t_run->min = (elapsed / 60000) % 60;
-        t_run->sec = (elapsed / 1000) % 60;
-        t_run->ms = elapsed % 1000;
-        t_run->padding = 0;
-    #endif /*PC_LINUX*/
-
+    r_log_driver_time_run_get(t_run);
 }
 
 /**
  * 日志获取本地时间
  */
-static inline void r_log_time_local_get(r_log_time_local_t *t_local)
+static inline void r_log_time_local_get(r_log_dev_tl_t *t_local)
 {
-    #ifdef PC_WIN
-        time_t now = time(NULL);
-        struct tm *local = localtime(&now);  // 本地时间
-        t_local->time_stemp = now;
-        t_local->year = local->tm_year + 1900,
-        t_local->month= local->tm_mon + 1,
-        t_local->day  = local->tm_mday,
-        t_local->hour = local->tm_hour,
-        t_local->min  = local->tm_min,
-        t_local->sec  = local->tm_sec;
-        t_local->padding = 0;
-    #endif /*PC_WIN*/
-    #ifdef PC_LINUX
-        time_t now = time(NULL);
-        struct tm result;
-        struct tm *local = localtime_r(&now,&result);  // 本地时间
-        t_local->time_stemp = now;
-        t_local->year = local->tm_year + 1900,
-        t_local->month= local->tm_mon + 1,
-        t_local->day  = local->tm_mday,
-        t_local->hour = local->tm_hour,
-        t_local->min  = local->tm_min,
-        t_local->sec  = local->tm_sec;
-        t_local->padding = 0;
-    #endif /*PC_LINUX*/
+    r_log_driver_time_local_get(t_local);
 }
 
 // 左对齐：数字靠左，右侧填充
@@ -558,18 +529,38 @@ static inline uint16_t r_log_tool_10_to_str_right(char *buf, uint32_t number, ui
     return len;
 }
 
+#if (R_LOG_MEM_MODE == 3)
+// 工具，槽位分配器（原子 CAS 抢占）
+static inline uint8_t *r_log_tool_solt_alloc(void)
+{
+    for (uint32_t i = 0; i < R_LOG_QUEUE_SIZE; i++)
+    {
+        if (r_log_atomic_cas(&r_log_used[i], 0, 1))
+        {
+            return &r_log_mem[i * R_LOG_BUF_SIZE];  // 抢占成功
+        }
+    }
+    return NULL;                                    // 槽位耗尽
+}
+
+// 工具，槽位释放器
+static inline int32_t r_log_tool_solt_free(uint8_t *ptr)
+{
+    if (ptr == NULL) {return -1;} // 地址无效
+    uint32_t slot_id = (uint32_t)(ptr - r_log_mem) / R_LOG_BUF_SIZE;
+    if (slot_id < R_LOG_QUEUE_SIZE)
+    {
+        r_log_used[slot_id] = 0;
+    }
+    return 0;
+}
+#endif /*R_LOG_MEM_MODE*/
+
 #if (R_LOG_ENABLE == 1)
 // 初始化
 void r_log_init(void)
 {
-    #ifdef PC_WIN
-    start = GetTickCount64();
-    #endif /*PC_WIN*/
-    #ifdef PC_LINUX
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    start = (uint64_t )tv.tv_sec * 1000 + tv.tv_usec / 1000;
-    #endif /*PC_LINUX*/
+    r_log_driver_init();
 
     #if (R_LOG_LEVEL == 0)
         r_log_state.lv_debug = RLV_OFF;
@@ -623,10 +614,30 @@ void r_log_init(void)
     // 默认换行
     r_log_state.new_line = RLV_ON;
 
+    // 清空 TAG 模块表
+    #if (R_LOG_TAG_MODE == 1)
+    r_log_tag_count = 0;
+    #endif /*R_LOG_TAG_MODE*/
+
     // 清空缓冲区
     #if (R_LOG_MEM_MODE == 0)
     memset(r_log_tx_buf,0,R_LOG_BUF_SIZE);
+    #elif (R_LOG_MEM_MODE == 3)
+    for (uint32_t i = 0; i < R_LOG_QUEUE_SIZE; i++)
+    {
+        r_log_used[i] = 0;
+    }
+    memset(r_log_mem,0,R_LOG_MEM_SIZE);
     #endif /*R_LOG_MEM_MODE*/
+
+    // 清空队列
+    #if (R_LOG_OUT_MODE == 1)
+    memset(r_log_qune_mem,0,sizeof(r_log_qune_t)*R_LOG_QUEUE_SIZE);
+    r_log_qune_write = 0;
+    r_log_qune_read  = 0;
+    r_log_qune_count = 0;
+    r_log_qune_lock  = 0;
+    #endif /*R_LOG_OUT_MODE*/
 }
 #else
 void r_log_init(void)
@@ -679,37 +690,97 @@ void r_log_set_new_line(uint8_t enable)
 {((void)enable);}
 #endif /*R_LOG_ENABLE*/
 
+#if (R_LOG_ENABLE == 1) && (R_LOG_TAG_MODE == 1)
+
+// 查找模块索引，未登记返回 -1
+static int32_t r_log_tag_find(const char *tag)
+{
+    for (uint8_t i = 0; i < r_log_tag_count; i++)
+    {
+        if (strcmp(r_log_tag_tbl[i].tag, tag) == 0) { return (int32_t)i; }
+    }
+    return -1;
+}
+
+// TAG 过滤：返回 0=放行 1=丢弃（无模块/未登记 跟随全局放行）
+static uint8_t r_log_tag_check(const char *tag, r_log_level_t level)
+{
+    int32_t idx;
+    if (tag == NULL) { return 0; }
+    idx = r_log_tag_find(tag);
+    if (idx < 0) { return 0; }
+    if ((r_log_tag_tbl[idx].mask & (uint8_t)(1u << (uint8_t)level)) == 0) { return 1; }
+    return 0;
+}
+
+// TAG模式 登记/设置 模块输出等级位掩码（已登记则更新，未登记则追加）
+void r_log_tag_set(const char *tag, uint8_t mask)
+{
+    int32_t idx;
+    if (tag == NULL) { return; }
+    idx = r_log_tag_find(tag);
+    if (idx >= 0)
+    {
+        r_log_tag_tbl[idx].mask = mask;
+    }
+    else if (r_log_tag_count < R_LOG_TAG_MAX)
+    {
+        r_log_tag_tbl[r_log_tag_count].tag  = tag;
+        r_log_tag_tbl[r_log_tag_count].mask = mask;
+        r_log_tag_count++;
+    }
+}
+
+#else /* R_LOG_ENABLE==0 或 R_LOG_TAG_MODE==0 裁剪为空操作 */
+void r_log_tag_set(const char *tag, uint8_t mask)
+{ ((void)tag); ((void)mask); }
+#endif /*TAG模式*/
+
 #if (R_LOG_ENABLE == 1)
 // 日志通用输出函数
-int32_t r_log_out(r_log_level_t level,const char *f_name,uint32_t line,const char *fmt,...)
+int32_t r_log_out(r_log_level_t level,const char *tag, const char *f_name,uint32_t line,const char *fmt,...)
 {
-    r_log_time_run_t t_run = {0};
-    r_log_time_local_t t_local = {0};
+    r_log_dev_tr_t t_run = {0};
+    r_log_dev_tl_t t_local = {0};
     uint16_t tx_count = 0;
     uint16_t tmp = 0;
     uint8_t *buf_ops = 0;
     int32_t res = 0;
     va_list args;
 
+    // TAG 模块过滤（无模块/未登记 跟随全局放行）
+    #if (R_LOG_TAG_MODE == 1)
+    if (r_log_tag_check(tag, level)) { return R_LOG_ERROR_TAG; }
+    #endif /*R_LOG_TAG_MODE*/
+
+    #if (R_LOG_OUT_MODE == 1)
+
+    // 队列满后 丢弃日志
+    if(r_log_qune_count >= R_LOG_QUEUE_SIZE) // 粗略预检，锁内入队时会精确复查
+    {
+        return R_LOG_ERROR_QUNE;
+    }
+
+    #endif 
+
     // 动态内存分配
-    #if (R_LOG_MEM_MODE == 2)
+    #if (R_LOG_MEM_MODE == 1)
+    uint8_t r_log_tx_buf[R_LOG_BUF_SIZE] = {0};
+    #elif (R_LOG_MEM_MODE == 2)
     uint8_t *r_log_tx_buf = r_log_alloc(R_LOG_BUF_SIZE);
     if (!r_log_tx_buf) {return R_LOG_ERROR_MEMORY; } // 内存不足
     buf_ops = r_log_tx_buf;
-    #endif /*R_LOG_MEM_MODE*/
-
-    #if (R_LOG_MEM_MODE == 1)
-    uint8_t r_log_tx_buf[R_LOG_BUF_SIZE] = {0};
+    #elif (R_LOG_MEM_MODE == 3)
+    uint8_t *r_log_tx_buf = r_log_tool_solt_alloc();
+    if(r_log_tx_buf == NULL){return R_LOG_ERROR_SOLT;} // 槽位不足
     #endif /*R_LOG_MEM_MODE*/
     
     // 获取时间
     r_log_time_local_get(&t_local);
     r_log_time_run_get(&t_run);
 
-    // 静态内存
-    #if (R_LOG_MEM_MODE >= 0) || (R_LOG_MEM_MODE <= 1)
+    // 缓存为操作指针
     buf_ops = r_log_tx_buf;
-    #endif /*R_LOG_MEM_MODE*/
         
     // 添加运行时间
     #if ((R_LOG_TIME_RUN >= 1) && (R_LOG_TIME_RUN < 5))
@@ -924,6 +995,22 @@ int32_t r_log_out(r_log_level_t level,const char *f_name,uint32_t line,const cha
     }
     #endif /*R_LOG_LEVEL*/
 
+    // 添加标签
+    #if (R_LOG_TAG_MODE == 1)
+    if(tag == NULL)
+    {
+        memmove(buf_ops," (none)",7); buf_ops+=7;
+    }
+    else
+    {
+        *buf_ops++ = ' ';
+        *buf_ops++ = '(';
+        tmp = strlen(tag);
+        memmove(buf_ops,tag,tmp); buf_ops += tmp;
+        *buf_ops++ = ')';
+    }
+    #endif /*R_LOG_TAG_MODE*/
+
     // 添加信息
     *buf_ops++ = ' ';
     va_start(args, fmt);
@@ -945,6 +1032,8 @@ int32_t r_log_out(r_log_level_t level,const char *f_name,uint32_t line,const cha
         *buf_ops++ = '\n';
     }
 
+    #if (R_LOG_OUT_MODE == 0)
+
     // 发送组装好的字符串
     tx_count = buf_ops - r_log_tx_buf;
     r_log_send_data(r_log_tx_buf,tx_count);
@@ -952,11 +1041,108 @@ int32_t r_log_out(r_log_level_t level,const char *f_name,uint32_t line,const cha
     // 动态内存分配
     #if (R_LOG_MEM_MODE == 2)
     r_log_free(r_log_tx_buf);
+    #elif (R_LOG_MEM_MODE == 3)
+    r_log_tool_solt_free(r_log_tx_buf);
     #endif /*R_LOG_MEM_MODE*/
+
+    #elif (R_LOG_OUT_MODE == 1)
+
+    // 缓存组装好的字符串（锁内精确检查 + 入队，多生产者安全）
+    tx_count = buf_ops - r_log_tx_buf;
+    r_log_qune_lock_take();
+    if(r_log_qune_count >= R_LOG_QUEUE_SIZE)  // 预检后队列被填满，锁内兜底复查
+    {
+        r_log_qune_lock_give();
+        // 归还已取缓冲，避免池槽位/堆泄漏
+        #if (R_LOG_MEM_MODE == 2)
+        r_log_free(r_log_tx_buf);
+        #elif (R_LOG_MEM_MODE == 3)
+        r_log_tool_solt_free(r_log_tx_buf);
+        #endif /*R_LOG_MEM_MODE*/
+        return R_LOG_ERROR_QUNE;
+    }
+    r_log_qune_mem[r_log_qune_write].data = r_log_tx_buf;
+    r_log_qune_mem[r_log_qune_write].size = tx_count;
+    r_log_qune_count += 1;
+    r_log_qune_write += 1;
+    if(r_log_qune_write >= R_LOG_QUEUE_SIZE)
+    {
+        r_log_qune_write = 0;
+    }
+    r_log_qune_lock_give();
+
+    #endif /*R_LOG_OUT_MODE*/
 
     return R_LOG_OK;  // 正常
 }
 #else
 int32_t r_log_out(r_log_level_t level,const char *f_name,uint32_t line,const char *fmt,...) 
 { ((void)level);((void)f_name);((void)line);((void)fmt); return 0;}
+#endif /*R_LOG_ENABLE*/
+
+#if (R_LOG_ENABLE == 1)
+
+#if (R_LOG_OUT_MODE == 1)
+
+// 公共出队发送：锁内出队一条，锁外发送+释放。返回 1=已发送 0=队列空
+static inline int32_t r_log_qune_dequeue_send(void)
+{
+    uint8_t  *data = NULL;
+    uint32_t  size = 0;
+
+    // 锁内出队（数据指针拷出），发送放锁外，避免阻塞生产者
+    r_log_qune_lock_take();
+    if(r_log_qune_count > 0)
+    {
+        data = r_log_qune_mem[r_log_qune_read].data;
+        size = r_log_qune_mem[r_log_qune_read].size;
+        r_log_qune_read += 1;
+        if(r_log_qune_read >= R_LOG_QUEUE_SIZE)
+        { r_log_qune_read = 0; }
+        r_log_qune_count -= 1;
+    }
+    r_log_qune_lock_give();
+
+    // 锁外发送 + 释放
+    if(data != NULL)
+    {
+        r_log_send_data(data,size);
+        #if (R_LOG_MEM_MODE == 2)
+        r_log_free(data);
+        #elif (R_LOG_MEM_MODE == 3)
+        r_log_tool_solt_free(data);
+        #endif /*R_LOG_MEM_MODE*/
+        return 1;
+    }
+    return 0;
+}
+
+// 轮询发送：仅发送一条。返回 1=已发送 0=队列空
+int32_t r_log_poll(void)
+{
+    return r_log_qune_dequeue_send();
+}
+
+// 排空发送：将队列全部发送。返回发送条数
+int32_t r_log_flush(void)
+{
+    int32_t count = 0;
+    while (r_log_qune_dequeue_send())
+    {
+        count++;
+    }
+    return count;
+}
+#else /* R_LOG_OUT_MODE == 0 */
+int32_t r_log_poll(void)
+{ return 0; }
+int32_t r_log_flush(void)
+{ return 0; }
+#endif /*R_LOG_OUT_MODE*/
+
+#else /* R_LOG_ENABLE == 0 */
+int32_t r_log_poll(void)
+{ return 0; }
+int32_t r_log_flush(void)
+{ return 0; }
 #endif /*R_LOG_ENABLE*/
